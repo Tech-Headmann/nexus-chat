@@ -1,8 +1,25 @@
 import { create } from 'zustand'
 import { api, socket, connectSocket, disconnectSocket } from './api'
+import { applyTheme, C } from './theme'
 
-// Protected default channels that cannot be deleted
 const DEFAULT_CHANNEL_IDS = ['ch_general','ch_vibes','ch_tech','ch_gaming','ch_random']
+
+// Load saved prefs from localStorage
+function loadPrefs() {
+  try {
+    return JSON.parse(localStorage.getItem('nexus_prefs') || '{}')
+  } catch { return {} }
+}
+function savePrefs(prefs) {
+  try { localStorage.setItem('nexus_prefs', JSON.stringify(prefs)) } catch {}
+}
+
+const savedPrefs = loadPrefs()
+
+// Apply saved theme immediately on load
+if (savedPrefs.theme || savedPrefs.accent) {
+  applyTheme(savedPrefs.theme || 'dark', savedPrefs.accent || 'indigo')
+}
 
 export const useStore = create((set, get) => ({
 
@@ -27,6 +44,18 @@ export const useStore = create((set, get) => ({
     } catch (e) { set({ authErr: e.message, authBusy: false }) }
   },
 
+  logout: () => {
+    const { leaveVoice, voiceChannelId } = get()
+    if (voiceChannelId) leaveVoice()
+    disconnectSocket()
+    set({
+      me: null, channels: [], messages: [], friends: [],
+      requests: [], onlineUsers: [], activeChannel: null,
+      activeDmUserId: null, typingUsers: [], _bound: false,
+      voiceChannelId: null, localStream: null, voicePeers: [], peerConnections: {},
+    })
+  },
+
   _afterAuth: async (user) => {
     set({ me: user, authBusy: false })
     connectSocket(user.id)
@@ -37,6 +66,33 @@ export const useStore = create((set, get) => ({
     get()._bindSocket()
   },
 
+  /* ── Settings / Prefs ── */
+  prefs: {
+    theme:        savedPrefs.theme      || 'dark',
+    accent:       savedPrefs.accent     || 'indigo',
+    fontSize:     savedPrefs.fontSize   || 'medium',
+    compactMode:  savedPrefs.compactMode ?? false,
+    showAvatars:  savedPrefs.showAvatars ?? true,
+    soundEnabled: savedPrefs.soundEnabled ?? true,
+    status:       savedPrefs.status     || 'online',  // online | away | dnd | invisible
+  },
+  settingsOpen: false,
+
+  openSettings:  () => set({ settingsOpen: true }),
+  closeSettings: () => set({ settingsOpen: false }),
+
+  updatePref: (key, value) => {
+    const prefs = { ...get().prefs, [key]: value }
+    set({ prefs })
+    savePrefs(prefs)
+    if (key === 'theme' || key === 'accent') {
+      applyTheme(prefs.theme, prefs.accent)
+      // Force re-render by bumping a counter
+      set(s => ({ _themeVersion: (s._themeVersion || 0) + 1 }))
+    }
+  },
+  _themeVersion: 0,
+
   /* ── Channels & messages ── */
   channels:       [],
   activeChannel:  null,
@@ -45,10 +101,8 @@ export const useStore = create((set, get) => ({
   typingUsers:    [],
 
   openChannel: async (channel) => {
-    // Leave any voice call when switching channels
     const { voiceChannelId, leaveVoice } = get()
     if (voiceChannelId && voiceChannelId !== channel.id) leaveVoice()
-
     socket.emit('join_channel', { channelId: channel.id })
     set({ activeChannel: channel, activeDmUserId: null, messages: [], typingUsers: [] })
     const msgs = await api.messages(channel.id)
@@ -74,13 +128,9 @@ export const useStore = create((set, get) => ({
     if (activeChannel) socket.emit('typing', { channelId: activeChannel.id, isTyping })
   },
 
-  createChannel: (name, icon) => {
-    socket.emit('create_channel', { name, icon, description: '' })
-  },
+  createChannel: (name, icon) => socket.emit('create_channel', { name, icon, description: '' }),
 
-  deleteChannel: (channelId) => {
-    socket.emit('delete_channel', { channelId })
-  },
+  deleteChannel: (channelId) => socket.emit('delete_channel', { channelId }),
 
   canDeleteChannel: (channel) => {
     const { me } = get()
@@ -105,98 +155,65 @@ export const useStore = create((set, get) => ({
     setTimeout(() => set({ toast: null }), 3000)
   },
 
-  /* ════════════════════════════════════════════════════════════════════════
-     VOICE CALL STATE
-     Uses WebRTC for peer-to-peer audio, Socket.IO for signaling only
-  ════════════════════════════════════════════════════════════════════════ */
-  voiceChannelId:  null,   // channel we're currently in
-  voicePeers:      [],     // [{ userId, socketId, username, avatar, color, muted }]
+  /* ── Voice call ── */
+  voiceChannelId:  null,
+  voicePeers:      [],
   voiceMuted:      false,
-  localStream:     null,   // our microphone MediaStream
-  peerConnections: {},     // socketId → RTCPeerConnection
+  localStream:     null,
+  peerConnections: {},
 
   joinVoice: async (channelId) => {
-    const { me, peerConnections } = get()
-
-    // Get microphone
     let stream
     try {
       stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false })
-    } catch (e) {
+    } catch {
       get().showToast('Microphone access denied ❌', 'err')
       return
     }
-
     set({ voiceChannelId: channelId, localStream: stream, voicePeers: [], voiceMuted: false })
-
-    // Tell server we joined — it responds with voice_peers (existing users)
     socket.emit('voice_join', { channelId })
   },
 
   leaveVoice: () => {
     const { voiceChannelId, localStream, peerConnections } = get()
-
-    // Stop mic
     if (localStream) localStream.getTracks().forEach(t => t.stop())
-
-    // Close all peer connections
     Object.values(peerConnections).forEach(pc => pc.close())
-
     if (voiceChannelId) socket.emit('voice_leave', { channelId: voiceChannelId })
-
     set({ voiceChannelId: null, localStream: null, voicePeers: [], peerConnections: {}, voiceMuted: false })
   },
 
   toggleMute: () => {
     const { localStream, voiceMuted, voiceChannelId } = get()
     if (!localStream) return
-    const newMuted = !voiceMuted
-    localStream.getAudioTracks().forEach(t => { t.enabled = !newMuted })
-    set({ voiceMuted: newMuted })
-    socket.emit('voice_mute', { channelId: voiceChannelId, muted: newMuted })
+    const muted = !voiceMuted
+    localStream.getAudioTracks().forEach(t => { t.enabled = !muted })
+    set({ voiceMuted: muted })
+    socket.emit('voice_mute', { channelId: voiceChannelId, muted })
   },
 
-  // Create a WebRTC peer connection to a remote peer
   _createPeerConnection: (targetSocketId) => {
-    const { localStream, peerConnections, voiceChannelId } = get()
-
+    const { localStream, voiceChannelId } = get()
     const pc = new RTCPeerConnection({
       iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
         { urls: 'stun:stun1.l.google.com:19302' },
       ],
     })
-
-    // Add our audio tracks
-    if (localStream) {
-      localStream.getTracks().forEach(track => pc.addTrack(track, localStream))
+    if (localStream) localStream.getTracks().forEach(t => pc.addTrack(t, localStream))
+    pc.onicecandidate = e => {
+      if (e.candidate) socket.emit('voice_ice', { targetSocketId, candidate: e.candidate })
     }
-
-    // When we get ICE candidates, send them to the peer
-    pc.onicecandidate = (e) => {
-      if (e.candidate) {
-        socket.emit('voice_ice', { targetSocketId, candidate: e.candidate })
-      }
-    }
-
-    // When we receive remote audio tracks, play them
-    pc.ontrack = (e) => {
+    pc.ontrack = e => {
       const audio = new Audio()
       audio.srcObject = e.streams[0]
       audio.autoplay = true
       audio.play().catch(() => {})
     }
-
     pc.onconnectionstatechange = () => {
       if (['disconnected','failed','closed'].includes(pc.connectionState)) {
-        set(s => {
-          const pcs = { ...s.peerConnections }
-          delete pcs[targetSocketId]
-          return { peerConnections: pcs }
-        })
+        set(s => { const p = { ...s.peerConnections }; delete p[targetSocketId]; return { peerConnections: p } })
       }
     }
-
     set(s => ({ peerConnections: { ...s.peerConnections, [targetSocketId]: pc } }))
     return pc
   },
@@ -208,12 +225,36 @@ export const useStore = create((set, get) => ({
     set({ _bound: true })
 
     socket.on('new_message', (msg) => {
-      const { activeChannel } = get()
-      if (activeChannel && msg.channel_id === activeChannel.id)
+      const { activeChannel, prefs } = get()
+      if (activeChannel && msg.channel_id === activeChannel.id) {
         set(s => ({ messages: [...s.messages, msg] }))
+        // Notification sound
+        if (prefs.soundEnabled && msg.author_id !== get().me?.id) {
+          try {
+            const ctx = new AudioContext()
+            const osc = ctx.createOscillator()
+            const gain = ctx.createGain()
+            osc.connect(gain); gain.connect(ctx.destination)
+            osc.frequency.value = 880; gain.gain.value = 0.05
+            osc.start(); osc.stop(ctx.currentTime + 0.08)
+          } catch {}
+        }
+      }
     })
 
     socket.on('online_update', (ids) => set({ onlineUsers: ids }))
+
+    // Server deleted our account → force logout
+    socket.on('account_deleted', () => get().logout())
+
+    // Someone changed their username → update their name in messages/friends lists
+    socket.on('user_updated', (user) => {
+      set(s => ({
+        friends:  s.friends.map(f  => f.id === user.id ? { ...f, username: user.username } : f),
+        messages: s.messages.map(m => m.author_id === user.id ? { ...m, username: user.username } : m),
+        me:       s.me?.id === user.id ? { ...s.me, username: user.username } : s.me,
+      }))
+    })
 
     socket.on('channel_created', (chan) => {
       set(s => ({ channels: [...s.channels.filter(c => c.id !== chan.id), chan] }))
@@ -260,10 +301,7 @@ export const useStore = create((set, get) => ({
 
     socket.on('error', (msg) => get().showToast(msg, 'err'))
 
-    /* ── Voice signaling events ── */
-
-    // Server tells us who is already in the voice room when we join
-    // We initiate offers TO each of them
+    /* Voice signaling */
     socket.on('voice_peers', async (peers) => {
       const { _createPeerConnection, voiceChannelId } = get()
       for (const peer of peers) {
@@ -272,86 +310,57 @@ export const useStore = create((set, get) => ({
         await pc.setLocalDescription(offer)
         socket.emit('voice_offer', { targetSocketId: peer.socketId, offer, channelId: voiceChannelId })
       }
-      set(s => ({
-        voicePeers: peers.map(p => ({ ...p, muted: false })),
-      }))
+      set(() => ({ voicePeers: peers.map(p => ({ ...p, muted: false })) }))
     })
 
-    // A new peer joined the room — they will send us an offer
     socket.on('voice_peer_joined', (peer) => {
       get()._createPeerConnection(peer.socketId)
-      set(s => ({
-        voicePeers: [...s.voicePeers.filter(p => p.socketId !== peer.socketId), { ...peer, muted: false }],
-      }))
+      set(s => ({ voicePeers: [...s.voicePeers.filter(p => p.socketId !== peer.socketId), { ...peer, muted: false }] }))
     })
 
-    // We received an offer from a peer who was already in the room
     socket.on('voice_offer', async ({ offer, fromSocketId, channelId }) => {
-      let { peerConnections, _createPeerConnection, voiceChannelId } = get()
+      const { peerConnections, _createPeerConnection, voiceChannelId } = get()
       if (voiceChannelId !== channelId) return
-
       let pc = peerConnections[fromSocketId]
       if (!pc) pc = _createPeerConnection(fromSocketId)
-
       await pc.setRemoteDescription(new RTCSessionDescription(offer))
       const answer = await pc.createAnswer()
       await pc.setLocalDescription(answer)
       socket.emit('voice_answer', { targetSocketId: fromSocketId, answer, channelId })
     })
 
-    // We received an answer to our offer
     socket.on('voice_answer', async ({ answer, fromSocketId }) => {
-      const { peerConnections } = get()
-      const pc = peerConnections[fromSocketId]
+      const pc = get().peerConnections[fromSocketId]
       if (pc) await pc.setRemoteDescription(new RTCSessionDescription(answer))
     })
 
-    // ICE candidate from a peer
     socket.on('voice_ice', async ({ candidate, fromSocketId }) => {
-      const { peerConnections } = get()
-      const pc = peerConnections[fromSocketId]
-      if (pc) {
-        try { await pc.addIceCandidate(new RTCIceCandidate(candidate)) }
-        catch (e) { /* ignore stale candidates */ }
-      }
+      const pc = get().peerConnections[fromSocketId]
+      if (pc) try { await pc.addIceCandidate(new RTCIceCandidate(candidate)) } catch {}
     })
 
-    // A peer left the voice room
-    socket.on('voice_peer_left', ({ socketId, userId }) => {
-      const { peerConnections } = get()
-      const pc = peerConnections[socketId]
-      if (pc) { pc.close() }
+    socket.on('voice_peer_left', ({ socketId }) => {
+      const pc = get().peerConnections[socketId]
+      if (pc) pc.close()
       set(s => {
-        const pcs = { ...s.peerConnections }
-        delete pcs[socketId]
-        return {
-          peerConnections: pcs,
-          voicePeers: s.voicePeers.filter(p => p.socketId !== socketId),
-        }
+        const p = { ...s.peerConnections }; delete p[socketId]
+        return { peerConnections: p, voicePeers: s.voicePeers.filter(p => p.socketId !== socketId) }
       })
     })
 
-    // Voice room state update (full peer list)
     socket.on('voice_room_update', ({ channelId, peers }) => {
       const { voiceChannelId, me } = get()
-      // Update voice peers list, preserving mute state
       if (voiceChannelId === channelId) {
         set(s => ({
           voicePeers: peers
             .filter(p => p.userId !== me?.id)
-            .map(p => ({
-              ...p,
-              muted: s.voicePeers.find(vp => vp.socketId === p.socketId)?.muted || false,
-            })),
+            .map(p => ({ ...p, muted: s.voicePeers.find(v => v.socketId === p.socketId)?.muted || false })),
         }))
       }
     })
 
-    // Peer muted/unmuted
     socket.on('voice_peer_muted', ({ userId, muted }) => {
-      set(s => ({
-        voicePeers: s.voicePeers.map(p => p.userId === userId ? { ...p, muted } : p),
-      }))
+      set(s => ({ voicePeers: s.voicePeers.map(p => p.userId === userId ? { ...p, muted } : p) }))
     })
   },
 }))

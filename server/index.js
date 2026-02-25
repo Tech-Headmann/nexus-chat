@@ -19,7 +19,7 @@ const PORT    = process.env.PORT || 3001;
 const DB_DIR  = path.join(__dirname, 'data');
 const DB_PATH = path.join(DB_DIR, 'nexus.db');
 
-/* ─── Database ───────────────────────────────────────────────────────────── */
+/* ─── Database ── */
 let db;
 
 function saveDb() {
@@ -85,7 +85,7 @@ async function initDb() {
   console.log('✓ Database ready');
 }
 
-/* ─── DB helpers ─────────────────────────────────────────────────────────── */
+/* ─── Helpers ── */
 function dbAll(sql, params = []) {
   try {
     const stmt = db.prepare(sql);
@@ -99,13 +99,15 @@ function dbAll(sql, params = []) {
 const dbGet = (sql, p = []) => dbAll(sql, p)[0] || null;
 const dbRun = (sql, p = []) => db.run(sql, p);
 
-/* ─── In-memory state ────────────────────────────────────────────────────── */
-const online    = new Map();  // userId → socketId
-const voiceRooms = new Map(); // channelId → Set of { userId, socketId, username, avatar }
+/* ─── In-memory state ── */
+const online     = new Map();  // userId → socketId
+const voiceRooms = new Map();  // channelId → Set of peers
 
 /* ══════════════════════════════════════════════════════════════════════════
    REST API
 ══════════════════════════════════════════════════════════════════════════ */
+
+/* ── Auth ── */
 app.post('/api/register', async (req, res) => {
   const { username, password, avatar, color } = req.body;
   if (!username?.trim() || !password)  return res.status(400).json({ error: 'Missing fields' });
@@ -130,6 +132,79 @@ app.post('/api/login', async (req, res) => {
   res.json({ user });
 });
 
+/* ── Account management ── */
+app.post('/api/account/username', async (req, res) => {
+  const { userId, newUsername, password } = req.body;
+  if (!userId || !newUsername?.trim() || !password)
+    return res.status(400).json({ error: 'Missing fields' });
+  if (newUsername.trim().length < 2)
+    return res.status(400).json({ error: 'Username must be 2+ characters' });
+
+  const user = dbGet('SELECT * FROM users WHERE id=?', [userId]);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  if (!await bcrypt.compare(password, user.password_hash))
+    return res.status(401).json({ error: 'Incorrect password' });
+
+  const taken = dbGet('SELECT id FROM users WHERE LOWER(username)=LOWER(?) AND id!=?', [newUsername.trim(), userId]);
+  if (taken) return res.status(409).json({ error: 'Username already taken' });
+
+  dbRun('UPDATE users SET username=? WHERE id=?', [newUsername.trim(), userId]);
+  saveDb();
+
+  // Notify all sockets that this user's name changed
+  const updatedUser = dbGet('SELECT id,username,avatar,color,created_at FROM users WHERE id=?', [userId]);
+  io.emit('user_updated', updatedUser);
+  res.json({ user: updatedUser });
+});
+
+app.post('/api/account/password', async (req, res) => {
+  const { userId, currentPassword, newPassword } = req.body;
+  if (!userId || !currentPassword || !newPassword)
+    return res.status(400).json({ error: 'Missing fields' });
+  if (newPassword.length < 4)
+    return res.status(400).json({ error: 'New password must be 4+ characters' });
+
+  const user = dbGet('SELECT * FROM users WHERE id=?', [userId]);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  if (!await bcrypt.compare(currentPassword, user.password_hash))
+    return res.status(401).json({ error: 'Incorrect current password' });
+
+  const hash = await bcrypt.hash(newPassword, 10);
+  dbRun('UPDATE users SET password_hash=? WHERE id=?', [hash, userId]);
+  saveDb();
+  res.json({ ok: true });
+});
+
+app.post('/api/account/delete', async (req, res) => {
+  const { userId, password } = req.body;
+  if (!userId || !password) return res.status(400).json({ error: 'Missing fields' });
+
+  const user = dbGet('SELECT * FROM users WHERE id=?', [userId]);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  if (!await bcrypt.compare(password, user.password_hash))
+    return res.status(401).json({ error: 'Incorrect password' });
+
+  // Delete all user data
+  dbRun('DELETE FROM messages       WHERE author_id=?', [userId]);
+  dbRun('DELETE FROM friends        WHERE user_id=? OR friend_id=?', [userId, userId]);
+  dbRun('DELETE FROM friend_requests WHERE from_id=? OR to_id=?', [userId, userId]);
+  dbRun('DELETE FROM channel_members WHERE user_id=?', [userId]);
+  dbRun('DELETE FROM users          WHERE id=?', [userId]);
+  saveDb();
+
+  // Force disconnect the user's socket
+  const socketId = online.get(userId);
+  if (socketId) {
+    io.to(socketId).emit('account_deleted');
+    online.delete(userId);
+    io.emit('online_update', Array.from(online.keys()));
+  }
+
+  console.log(`🗑 Account deleted: ${user.username}`);
+  res.json({ ok: true });
+});
+
+/* ── Channels & messages ── */
 app.get('/api/channels', (_, res) =>
   res.json(dbAll('SELECT * FROM channels WHERE is_dm=0 ORDER BY created_at')));
 
@@ -138,17 +213,18 @@ app.get('/api/channels/:id/messages', (req, res) =>
     SELECT m.id, m.channel_id, m.author_id, m.content, m.created_at,
            u.username, u.avatar, u.color
     FROM messages m JOIN users u ON u.id=m.author_id
-    WHERE m.channel_id=? ORDER BY m.created_at ASC LIMIT 100
+    WHERE m.channel_id=? ORDER BY m.created_at ASC LIMIT 200
   `, [req.params.id])));
 
+/* ── Users ── */
 app.get('/api/users/search', (req, res) =>
   res.json(dbAll('SELECT id,username,avatar,color FROM users WHERE username LIKE ? ORDER BY username LIMIT 30',
     [`%${req.query.q||''}%`])));
-
 app.get('/api/users',           (_, res) => res.json(dbAll('SELECT id,username,avatar,color FROM users ORDER BY username')));
 app.get('/api/users/:id/friends',  (req, res) => res.json(dbAll(`SELECT u.id,u.username,u.avatar,u.color FROM friends f JOIN users u ON u.id=f.friend_id WHERE f.user_id=?`, [req.params.id])));
 app.get('/api/users/:id/requests', (req, res) => res.json(dbAll(`SELECT fr.id,fr.from_id,fr.to_id,fr.created_at,u.username,u.avatar,u.color FROM friend_requests fr JOIN users u ON u.id=fr.from_id WHERE fr.to_id=?`, [req.params.id])));
 
+/* ── DM ── */
 app.post('/api/dm', (req, res) => {
   const { userA, userB } = req.body;
   const dmId = 'dm_' + [userA, userB].sort().join('_');
@@ -160,11 +236,11 @@ app.post('/api/dm', (req, res) => {
   }
   res.json({
     channel:  dbGet('SELECT * FROM channels WHERE id=?', [dmId]),
-    messages: dbAll(`SELECT m.id,m.channel_id,m.author_id,m.content,m.created_at,u.username,u.avatar,u.color FROM messages m JOIN users u ON u.id=m.author_id WHERE m.channel_id=? ORDER BY m.created_at ASC LIMIT 100`, [dmId]),
+    messages: dbAll(`SELECT m.id,m.channel_id,m.author_id,m.content,m.created_at,u.username,u.avatar,u.color FROM messages m JOIN users u ON u.id=m.author_id WHERE m.channel_id=? ORDER BY m.created_at ASC LIMIT 200`, [dmId]),
   });
 });
 
-/* ── Voice room state endpoint ── */
+/* ── Voice room state ── */
 app.get('/api/voice/:channelId', (req, res) => {
   const room = voiceRooms.get(req.params.channelId);
   res.json(room ? Array.from(room) : []);
@@ -178,7 +254,6 @@ io.on('connection', (socket) => {
   let currentRoom = null;
   let inVoiceChannel = null;
 
-  /* ── Auth ── */
   socket.on('auth', ({ userId }) => {
     currentUser = dbGet('SELECT id,username,avatar,color FROM users WHERE id=?', [userId]);
     if (!currentUser) return;
@@ -187,14 +262,12 @@ io.on('connection', (socket) => {
     console.log(`✓ ${currentUser.username} connected (${online.size} online)`);
   });
 
-  /* ── Join text channel ── */
   socket.on('join_channel', ({ channelId }) => {
     if (currentRoom) socket.leave(currentRoom);
     currentRoom = channelId;
     socket.join(channelId);
   });
 
-  /* ── Send message ── */
   socket.on('send_message', ({ channelId, content }) => {
     if (!currentUser || !content?.trim()) return;
     const id = uuid().replace(/-/g,'').slice(0,12);
@@ -214,10 +287,13 @@ io.on('connection', (socket) => {
     if (!currentUser) return;
     const chan = dbGet('SELECT * FROM channels WHERE id=?', [channelId]);
     if (!chan) return socket.emit('error', 'Channel not found');
-    // Only creator or if no creator (legacy) can delete; default channels are protected
     const defaultIds = ['ch_general','ch_vibes','ch_tech','ch_gaming','ch_random'];
-    if (defaultIds.includes(channelId)) return socket.emit('error', 'Default channels cannot be deleted');
-    if (chan.created_by && chan.created_by !== currentUser.id)
+    if (defaultIds.includes(channelId)) return socket.emit('error', "Default channels can't be deleted");
+
+    // Allow creator OR any user if channel has no creator recorded
+    const createdBy = chan.created_by ? String(chan.created_by).trim() : null;
+    const myId = String(currentUser.id).trim();
+    if (createdBy && createdBy !== myId)
       return socket.emit('error', 'Only the channel creator can delete it');
 
     dbRun('DELETE FROM messages WHERE channel_id=?', [channelId]);
@@ -225,18 +301,26 @@ io.on('connection', (socket) => {
     dbRun('DELETE FROM channels WHERE id=?', [channelId]);
     saveDb();
     io.emit('channel_deleted', { channelId });
-    console.log(`🗑 Channel ${chan.name} deleted by ${currentUser.username}`);
+    console.log(`🗑 #${chan.name} deleted by ${currentUser.username}`);
   });
 
-  /* ── Typing ── */
+  socket.on('create_channel', ({ name, icon, description }) => {
+    if (!currentUser) return;
+    const slug = name.trim().toLowerCase().replace(/\s+/g,'-').replace(/[^a-z0-9-]/g,'') || 'channel';
+    const id   = 'ch_' + uuid().replace(/-/g,'').slice(0,8);
+    const ts   = Math.floor(Date.now() / 1000);
+    dbRun('INSERT INTO channels (id,name,icon,description,is_dm,created_by,created_at) VALUES (?,?,?,?,0,?,?)',
+      [id, slug, icon||'✨', description||'', currentUser.id, ts]);
+    saveDb();
+    io.emit('channel_created', dbGet('SELECT * FROM channels WHERE id=?', [id]));
+  });
+
   socket.on('typing', ({ channelId, isTyping }) => {
     if (!currentUser) return;
-    socket.to(channelId).emit('user_typing', {
-      userId: currentUser.id, username: currentUser.username, isTyping,
-    });
+    socket.to(channelId).emit('user_typing', { userId: currentUser.id, username: currentUser.username, isTyping });
   });
 
-  /* ── Friend requests ── */
+  /* ── Friends ── */
   socket.on('send_friend_request', ({ toId }) => {
     if (!currentUser) return;
     if (dbGet('SELECT 1 FROM friends WHERE user_id=? AND friend_id=?', [currentUser.id, toId]))
@@ -247,8 +331,7 @@ io.on('connection', (socket) => {
     const ts = Math.floor(Date.now() / 1000);
     try { dbRun('INSERT INTO friend_requests (id,from_id,to_id,created_at) VALUES (?,?,?,?)', [id, currentUser.id, toId, ts]); saveDb(); }
     catch { return socket.emit('error', 'Could not send request'); }
-    const reqData = { id, from_id: currentUser.id, to_id: toId, created_at: ts,
-      username: currentUser.username, avatar: currentUser.avatar, color: currentUser.color };
+    const reqData = { id, from_id: currentUser.id, to_id: toId, created_at: ts, username: currentUser.username, avatar: currentUser.avatar, color: currentUser.color };
     const toSocket = online.get(toId);
     if (toSocket) io.to(toSocket).emit('friend_request', reqData);
     socket.emit('request_sent', reqData);
@@ -271,127 +354,40 @@ io.on('connection', (socket) => {
     socket.emit('request_declined', { requestId });
   });
 
-  socket.on('create_channel', ({ name, icon, description }) => {
-    if (!currentUser) return;
-    const slug = name.trim().toLowerCase().replace(/\s+/g,'-').replace(/[^a-z0-9-]/g,'');
-    const id   = 'ch_' + uuid().replace(/-/g,'').slice(0,8);
-    const ts   = Math.floor(Date.now() / 1000);
-    dbRun('INSERT INTO channels (id,name,icon,description,is_dm,created_by,created_at) VALUES (?,?,?,?,0,?,?)',
-      [id, slug, icon||'✨', description||'', currentUser.id, ts]);
-    saveDb();
-    io.emit('channel_created', dbGet('SELECT * FROM channels WHERE id=?', [id]));
-    socket.emit('channel_joined', { channelId: id });
-  });
-
-  /* ════════════════════════════════════════════════════════════════════════
-     VOICE CALL SIGNALING (WebRTC)
-     
-     Flow:
-     1. User A joins voice room → server tells everyone else in room
-     2. Existing users in room send WebRTC "offer" to User A
-     3. User A replies with "answer"
-     4. Both exchange ICE candidates
-     5. WebRTC peer connection established (audio flows directly peer-to-peer)
-  ════════════════════════════════════════════════════════════════════════ */
-
+  /* ── Voice signaling ── */
   socket.on('voice_join', ({ channelId }) => {
     if (!currentUser) return;
-
     if (!voiceRooms.has(channelId)) voiceRooms.set(channelId, new Set());
     const room = voiceRooms.get(channelId);
-
-    // Tell this user who is already in the room (so they can initiate offers)
-    const existingPeers = Array.from(room).map(p => ({
-      userId:   p.userId,
-      socketId: p.socketId,
-      username: p.username,
-      avatar:   p.avatar,
-      color:    p.color,
-    }));
+    const existingPeers = Array.from(room);
     socket.emit('voice_peers', existingPeers);
-
-    // Add this user to the room
-    room.add({
-      userId:   currentUser.id,
-      socketId: socket.id,
-      username: currentUser.username,
-      avatar:   currentUser.avatar,
-      color:    currentUser.color,
-    });
-
+    room.add({ userId: currentUser.id, socketId: socket.id, username: currentUser.username, avatar: currentUser.avatar, color: currentUser.color });
     inVoiceChannel = channelId;
-
-    // Tell everyone else in the room that a new peer joined
-    socket.to(channelId).emit('voice_peer_joined', {
-      userId:   currentUser.id,
-      socketId: socket.id,
-      username: currentUser.username,
-      avatar:   currentUser.avatar,
-      color:    currentUser.color,
-    });
-
+    socket.to(channelId).emit('voice_peer_joined', { userId: currentUser.id, socketId: socket.id, username: currentUser.username, avatar: currentUser.avatar, color: currentUser.color });
     socket.join(`voice_${channelId}`);
-
-    // Broadcast updated voice room state to everyone in the channel
     io.to(channelId).emit('voice_room_update', { channelId, peers: Array.from(room) });
-    console.log(`🎙 ${currentUser.username} joined voice in ${channelId} (${room.size} in room)`);
   });
 
-  socket.on('voice_leave', ({ channelId }) => {
-    leaveVoice(channelId);
-  });
+  socket.on('voice_leave', ({ channelId }) => leaveVoice(channelId));
 
-  // WebRTC signaling — relay offer/answer/ICE between specific peers
-  socket.on('voice_offer', ({ targetSocketId, offer, channelId }) => {
-    io.to(targetSocketId).emit('voice_offer', {
-      offer,
-      fromSocketId: socket.id,
-      fromUserId:   currentUser?.id,
-      channelId,
-    });
-  });
-
-  socket.on('voice_answer', ({ targetSocketId, answer, channelId }) => {
-    io.to(targetSocketId).emit('voice_answer', {
-      answer,
-      fromSocketId: socket.id,
-      channelId,
-    });
-  });
-
-  socket.on('voice_ice', ({ targetSocketId, candidate }) => {
-    io.to(targetSocketId).emit('voice_ice', {
-      candidate,
-      fromSocketId: socket.id,
-    });
-  });
-
-  // Mute/unmute broadcast
-  socket.on('voice_mute', ({ channelId, muted }) => {
-    if (!currentUser) return;
-    socket.to(`voice_${channelId}`).emit('voice_peer_muted', {
-      userId: currentUser.id,
-      muted,
-    });
+  socket.on('voice_offer',  ({ targetSocketId, offer, channelId })  => io.to(targetSocketId).emit('voice_offer',  { offer, fromSocketId: socket.id, channelId }));
+  socket.on('voice_answer', ({ targetSocketId, answer, channelId }) => io.to(targetSocketId).emit('voice_answer', { answer, fromSocketId: socket.id, channelId }));
+  socket.on('voice_ice',    ({ targetSocketId, candidate })         => io.to(targetSocketId).emit('voice_ice',    { candidate, fromSocketId: socket.id }));
+  socket.on('voice_mute',   ({ channelId, muted }) => {
+    if (currentUser) socket.to(`voice_${channelId}`).emit('voice_peer_muted', { userId: currentUser.id, muted });
   });
 
   function leaveVoice(channelId) {
     if (!channelId) return;
     const room = voiceRooms.get(channelId);
     if (room) {
-      for (const peer of room) {
-        if (peer.socketId === socket.id) { room.delete(peer); break; }
-      }
+      for (const peer of room) { if (peer.socketId === socket.id) { room.delete(peer); break; } }
       if (room.size === 0) voiceRooms.delete(channelId);
       else io.to(channelId).emit('voice_room_update', { channelId, peers: Array.from(room) });
     }
-    socket.to(`voice_${channelId}`).emit('voice_peer_left', {
-      socketId: socket.id,
-      userId:   currentUser?.id,
-    });
+    socket.to(`voice_${channelId}`).emit('voice_peer_left', { socketId: socket.id, userId: currentUser?.id });
     socket.leave(`voice_${channelId}`);
     inVoiceChannel = null;
-    console.log(`🔇 ${currentUser?.username} left voice in ${channelId}`);
   }
 
   socket.on('disconnect', () => {
@@ -404,8 +400,7 @@ io.on('connection', (socket) => {
   });
 });
 
-/* ─── Start ──────────────────────────────────────────────────────────────── */
+/* ─── Start ── */
 initDb().then(() => {
-  server.listen(PORT, () =>
-    console.log(`\n⚛  NEXUS Chat server → http://localhost:${PORT}\n`));
+  server.listen(PORT, () => console.log(`\n⚛  NEXUS Chat → http://localhost:${PORT}\n`));
 }).catch(err => { console.error('Failed to start:', err); process.exit(1); });
