@@ -1,9 +1,9 @@
-import { useState, useEffect } from 'react'
+import { useState } from 'react'
 import { useStore } from '../lib/store'
 import { C, CHAN_ICONS } from '../lib/theme'
 import { api } from '../lib/api'
 
-/* ── Shared avatar component ── */
+/* ── Shared components ─────────────────────────────────────────────────────── */
 export function Avatar({ avatar, color, size = 30, radius = 9 }) {
   return (
     <div style={{ width:size, height:size, borderRadius:radius, background:(color||C.accent)+'33', display:'flex', alignItems:'center', justifyContent:'center', fontSize:size*0.55, flexShrink:0 }}>
@@ -12,21 +12,27 @@ export function Avatar({ avatar, color, size = 30, radius = 9 }) {
   )
 }
 
-/* ── Status dot ── */
 export function Dot({ online, bg = C.sidebar }) {
   return (
     <div style={{ position:'absolute', bottom:-2, right:-2, width:9, height:9, borderRadius:'50%', background: online ? C.emerald : C.sub, border:`2px solid ${bg}` }} />
   )
 }
 
+/* ── Main Sidebar ──────────────────────────────────────────────────────────── */
 export default function Sidebar({ view, setView }) {
-  const { me, channels, friends, requests, onlineUsers, openChannel, openDm, createChannel, sendFriendRequest, acceptRequest, declineRequest } = useStore()
+  const {
+    me, channels, friends, requests, onlineUsers,
+    openChannel, openDm, createChannel, deleteChannel, canDeleteChannel,
+    sendFriendRequest, acceptRequest, declineRequest,
+    voiceChannelId, joinVoice,
+  } = useStore()
 
   const [newChanOpen, setNewChanOpen] = useState(false)
   const [newChanName, setNewChanName] = useState('')
   const [newChanIcon, setNewChanIcon] = useState('✨')
   const [search,      setSearch]      = useState('')
   const [searchRes,   setSearchRes]   = useState(null)
+  const [confirmDel,  setConfirmDel]  = useState(null) // channelId pending delete confirm
 
   const incomingReqs = requests.filter(r => r.to_id === me?.id)
   const isOnline = (id) => onlineUsers.includes(id)
@@ -44,16 +50,28 @@ export default function Sidebar({ view, setView }) {
     setNewChanName(''); setNewChanIcon('✨'); setNewChanOpen(false)
   }
 
+  const handleDelete = (ch) => {
+    if (confirmDel === ch.id) {
+      deleteChannel(ch.id)
+      setConfirmDel(null)
+    } else {
+      setConfirmDel(ch.id)
+      // Auto-cancel confirm after 3s
+      setTimeout(() => setConfirmDel(c => c === ch.id ? null : c), 3000)
+    }
+  }
+
   return (
     <div style={{ width:234, background:C.sidebar, borderRight:`1px solid ${C.border}`, display:'flex', flexDirection:'column', overflowY:'auto', flexShrink:0 }}>
 
-      {/* ── CHAT VIEW ── */}
+      {/* ── CHAT ── */}
       {view === 'chat' && (
         <>
           <SectionHead label="CHANNELS">
             <button onClick={() => setNewChanOpen(v => !v)} style={addBtn} title="New channel">＋</button>
           </SectionHead>
 
+          {/* New channel form */}
           {newChanOpen && (
             <div style={{ margin:'0 8px 8px', background:C.card, borderRadius:10, padding:10, border:`1px solid ${C.border}` }}>
               <div style={{ display:'flex', flexWrap:'wrap', gap:4, marginBottom:8 }}>
@@ -70,13 +88,21 @@ export default function Sidebar({ view, setView }) {
             </div>
           )}
 
+          {/* Channel list */}
           {channels.map(ch => (
-            <SideItem key={ch.id} onClick={() => { openChannel(ch); setView('chat') }}>
-              <span style={{ fontSize:14, marginRight:7, flexShrink:0 }}>{ch.icon}</span>
-              <span style={{ fontSize:13, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}># {ch.name}</span>
-            </SideItem>
+            <ChannelItem
+              key={ch.id}
+              ch={ch}
+              onOpen={() => { openChannel(ch); setView('chat') }}
+              onVoice={() => { if (voiceChannelId !== ch.id) joinVoice(ch.id); openChannel(ch); setView('chat') }}
+              canDel={canDeleteChannel(ch)}
+              confirmDel={confirmDel === ch.id}
+              onDelete={() => handleDelete(ch)}
+              inVoice={voiceChannelId === ch.id}
+            />
           ))}
 
+          {/* DMs */}
           {friends.length > 0 && (
             <>
               <SectionHead label="DIRECT MESSAGES" />
@@ -94,7 +120,7 @@ export default function Sidebar({ view, setView }) {
         </>
       )}
 
-      {/* ── DISCOVER VIEW ── */}
+      {/* ── DISCOVER ── */}
       {view === 'discover' && (
         <div style={{ padding:14 }}>
           <div style={sideTitle}>Find People</div>
@@ -112,7 +138,7 @@ export default function Sidebar({ view, setView }) {
         </div>
       )}
 
-      {/* ── FRIENDS VIEW ── */}
+      {/* ── FRIENDS ── */}
       {view === 'friends' && (
         <div style={{ padding:14 }}>
           <div style={sideTitle}>Friends</div>
@@ -135,7 +161,7 @@ export default function Sidebar({ view, setView }) {
         </div>
       )}
 
-      {/* ── NOTIFICATIONS VIEW ── */}
+      {/* ── NOTIFICATIONS ── */}
       {view === 'notifs' && (
         <div style={{ padding:14 }}>
           <div style={sideTitle}>Notifications</div>
@@ -163,6 +189,47 @@ export default function Sidebar({ view, setView }) {
   )
 }
 
+/* ── Channel item with delete + voice join ────────────────────────────────── */
+function ChannelItem({ ch, onOpen, onVoice, canDel, confirmDel, onDelete, inVoice }) {
+  const [hover, setHover] = useState(false)
+
+  return (
+    <div
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      style={{ display:'flex', alignItems:'center', padding:'6px 8px 6px 12px', margin:'1px 6px', borderRadius:9, cursor:'pointer', background: hover ? C.card : 'transparent', color: hover ? C.text : C.sub, transition:'all .12s', gap:4 }}
+    >
+      {/* Main click area */}
+      <div onClick={onOpen} style={{ display:'flex', alignItems:'center', flex:1, minWidth:0, gap:0 }}>
+        <span style={{ fontSize:14, marginRight:7, flexShrink:0 }}>{ch.icon}</span>
+        <span style={{ fontSize:13, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}># {ch.name}</span>
+      </div>
+
+      {/* Voice indicator / join button */}
+      {inVoice
+        ? <div style={{ fontSize:11, color:C.emerald, flexShrink:0 }} title="You're in this voice channel">🎙️</div>
+        : hover && (
+            <button onClick={e => { e.stopPropagation(); onVoice() }} title="Join voice" style={{ background:'none', border:'none', color:C.sub, fontSize:13, cursor:'pointer', padding:'0 2px', flexShrink:0, opacity:0.7 }}>
+              🔊
+            </button>
+          )
+      }
+
+      {/* Delete button — only for channel creator */}
+      {canDel && hover && (
+        <button
+          onClick={e => { e.stopPropagation(); onDelete() }}
+          title={confirmDel ? 'Click again to confirm delete' : 'Delete channel'}
+          style={{ background: confirmDel ? C.rose+'33' : 'none', border: confirmDel ? `1px solid ${C.rose}55` : 'none', color: confirmDel ? C.rose : C.sub, fontSize:11, cursor:'pointer', padding:'2px 5px', borderRadius:5, flexShrink:0, fontWeight: confirmDel ? 700 : 400 }}
+        >
+          {confirmDel ? '✕ sure?' : '🗑'}
+        </button>
+      )}
+    </div>
+  )
+}
+
+/* ── Shared sub-components ────────────────────────────────────────────────── */
 function SectionHead({ label, children }) {
   return (
     <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', padding:'14px 14px 5px', fontFamily:"'Bricolage Grotesque',sans-serif", fontWeight:700, fontSize:10, color:C.sub, letterSpacing:1, textTransform:'uppercase' }}>
@@ -203,6 +270,6 @@ function UserRow({ u, friends, isOnline, onAdd, onDm }) {
   )
 }
 
-const addBtn  = { background:'none', border:'none', color:C.sub, fontSize:20, lineHeight:1, padding:0 }
-const miniInp = { background:C.card2, border:`1px solid ${C.border}`, borderRadius:8, padding:'8px 10px', color:C.text, fontSize:13, outline:'none', boxSizing:'border-box' }
+const addBtn    = { background:'none', border:'none', color:C.sub, fontSize:20, lineHeight:1, padding:0 }
+const miniInp   = { background:C.card2, border:`1px solid ${C.border}`, borderRadius:8, padding:'8px 10px', color:C.text, fontSize:13, outline:'none', boxSizing:'border-box' }
 const sideTitle = { fontFamily:"'Bricolage Grotesque',sans-serif", fontWeight:700, fontSize:15, color:C.text, marginBottom:14, marginTop:16 }

@@ -4,13 +4,17 @@ import { C } from '../lib/theme'
 import { Avatar } from './Sidebar'
 
 export default function ChatArea() {
-  const { me, messages, activeChannel, activeDmUserId, friends, onlineUsers, typingUsers, sendMessage, setTyping, channels, openChannel } = useStore()
+  const {
+    me, messages, activeChannel, activeDmUserId, friends,
+    onlineUsers, typingUsers, sendMessage, setTyping,
+    channels, openChannel,
+    voiceChannelId, joinVoice, leaveVoice, voicePeers,
+  } = useStore()
 
   const [input,   setInput]   = useState('')
   const endRef                = useRef(null)
   const typingRef             = useRef(null)
 
-  // Scroll to bottom when messages change
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
@@ -35,18 +39,18 @@ export default function ChatArea() {
   }
 
   const onKey = (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault()
-      handleSend()
-    }
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend() }
   }
 
-  const isOnline = (id) => onlineUsers.includes(id)
+  const isOnline  = (id) => onlineUsers.includes(id)
+  const dmFriend  = activeDmUserId ? friends.find(f => f.id === activeDmUserId) : null
 
-  // Find DM friend info from friends list
-  const dmFriend = activeDmUserId ? friends.find(f => f.id === activeDmUserId) : null
+  // Voice state for this channel
+  const isDm           = activeChannel && (activeChannel.is_dm === 1 || activeChannel.is_dm === true)
+  const isInThisVoice  = voiceChannelId === activeChannel?.id
+  const voiceCount     = isInThisVoice ? voicePeers.length + 1 : 0
 
-  // No active chat — show welcome screen
+  /* ── Welcome screen ── */
   if (!activeChannel) {
     return (
       <div style={{ flex:1, display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', background:C.bg, gap:12 }}>
@@ -64,7 +68,6 @@ export default function ChatArea() {
     )
   }
 
-  const isDm      = activeChannel.is_dm === 1 || activeChannel.is_dm === true
   const chatTitle = isDm ? (dmFriend?.username || 'Direct Message') : `# ${activeChannel.name}`
   const chatSub   = isDm
     ? (isOnline(activeDmUserId) ? '● online' : '○ offline')
@@ -73,8 +76,8 @@ export default function ChatArea() {
   return (
     <div style={{ flex:1, display:'flex', flexDirection:'column', minWidth:0, background:C.bg }}>
 
-      {/* Header */}
-      <div style={{ padding:'13px 22px', borderBottom:`1px solid ${C.border}`, background:C.panel, display:'flex', alignItems:'center', justifyContent:'space-between', flexShrink:0 }}>
+      {/* ── Header ── */}
+      <div style={{ padding:'11px 18px', borderBottom:`1px solid ${C.border}`, background:C.panel, display:'flex', alignItems:'center', justifyContent:'space-between', flexShrink:0 }}>
         <div style={{ display:'flex', alignItems:'center', gap:12 }}>
           {isDm && dmFriend && (
             <div style={{ position:'relative' }}>
@@ -87,13 +90,36 @@ export default function ChatArea() {
             <div style={{ fontSize:11, color: isDm ? (isOnline(activeDmUserId) ? C.emerald : C.sub) : C.sub }}>{chatSub}</div>
           </div>
         </div>
-        <div style={{ display:'flex', alignItems:'center', gap:6 }}>
-          <div style={{ width:7, height:7, borderRadius:'50%', background:C.emerald, boxShadow:`0 0 6px ${C.emerald}` }} />
-          <div style={{ fontSize:11, color:C.sub }}>{onlineUsers.length} online</div>
+
+        {/* Right side — online count + voice button */}
+        <div style={{ display:'flex', alignItems:'center', gap:10 }}>
+          <div style={{ display:'flex', alignItems:'center', gap:5 }}>
+            <div style={{ width:7, height:7, borderRadius:'50%', background:C.emerald, boxShadow:`0 0 6px ${C.emerald}` }} />
+            <div style={{ fontSize:11, color:C.sub }}>{onlineUsers.length} online</div>
+          </div>
+
+          {/* Voice call button — only for public channels */}
+          {!isDm && (
+            isInThisVoice ? (
+              <button onClick={leaveVoice} style={voiceBtnActive} title="Leave voice call">
+                🎙️ {voiceCount > 0 && <span style={{ fontSize:10 }}>{voiceCount}</span>}
+                <span style={{ fontSize:11 }}>Leave</span>
+              </button>
+            ) : (
+              <button onClick={() => joinVoice(activeChannel.id)} style={voiceBtn} title="Join voice call">
+                🔊 <span style={{ fontSize:11 }}>Voice</span>
+              </button>
+            )
+          )}
         </div>
       </div>
 
-      {/* Messages */}
+      {/* ── Voice bar — shown when others are in voice but you're not ── */}
+      {!isDm && !isInThisVoice && voiceChannelId === null && (
+        <VoicePreviewBar channelId={activeChannel.id} />
+      )}
+
+      {/* ── Messages ── */}
       <div style={{ flex:1, overflowY:'auto', padding:'16px 22px', display:'flex', flexDirection:'column' }}>
         {messages.length === 0 && (
           <div style={{ textAlign:'center', color:C.sub, fontSize:14, paddingTop:48 }}>
@@ -109,14 +135,11 @@ export default function ChatArea() {
 
           return (
             <div key={msg.id} style={{ display:'flex', flexDirection: isMe ? 'row-reverse' : 'row', gap:9, alignItems:'flex-end', marginTop: grouped ? 2 : 12, animation:'fadeUp .2s ease both' }}>
-              {/* Avatar or spacer */}
               {grouped
                 ? <div style={{ width:34, flexShrink:0 }} />
                 : <Avatar avatar={msg.avatar} color={msg.color} size={34} radius={11} />
               }
-
               <div style={{ maxWidth:'62%', display:'flex', flexDirection:'column', alignItems: isMe ? 'flex-end' : 'flex-start' }}>
-                {/* Name + time */}
                 {!grouped && (
                   <div style={{ display:'flex', alignItems:'baseline', gap:6, flexDirection: isMe ? 'row-reverse' : 'row', marginBottom:3 }}>
                     <span style={{ fontFamily:"'Bricolage Grotesque',sans-serif", fontWeight:700, fontSize:12, color: msg.color || C.accent }}>
@@ -125,16 +148,15 @@ export default function ChatArea() {
                     <span style={{ fontSize:10, color:C.sub }}>{ts}</span>
                   </div>
                 )}
-                {/* Bubble */}
                 <div style={{
                   padding:'9px 14px', fontSize:14, lineHeight:1.55, color:C.text,
-                  background:     isMe ? C.accent : C.card,
-                  border:         `1px solid ${isMe ? 'transparent' : C.border}`,
-                  borderRadius:   isMe
+                  background:   isMe ? C.accent : C.card,
+                  border:       `1px solid ${isMe ? 'transparent' : C.border}`,
+                  borderRadius: isMe
                     ? (grouped ? '16px 4px 4px 16px' : '16px 4px 16px 16px')
                     : (grouped ? '4px 16px 16px 4px' : '4px 16px 16px 16px'),
-                  boxShadow:      isMe ? `0 4px 20px ${C.accent}33` : 'none',
-                  wordBreak:      'break-word',
+                  boxShadow:    isMe ? `0 4px 20px ${C.accent}33` : 'none',
+                  wordBreak:    'break-word',
                 }}>
                   {msg.content}
                 </div>
@@ -143,7 +165,6 @@ export default function ChatArea() {
           )
         })}
 
-        {/* Typing indicator */}
         {typingUsers.length > 0 && (
           <div style={{ display:'flex', alignItems:'center', gap:8, marginTop:8, color:C.sub, fontSize:12 }}>
             <div style={{ display:'flex', gap:3 }}>
@@ -158,7 +179,7 @@ export default function ChatArea() {
         <div ref={endRef} />
       </div>
 
-      {/* Input */}
+      {/* ── Input ── */}
       <div style={{ padding:'12px 22px 14px', borderTop:`1px solid ${C.border}`, background:C.panel, flexShrink:0 }}>
         <div style={{ display:'flex', alignItems:'center', gap:8, background:C.card, borderRadius:13, padding:'10px 14px', border:`1px solid ${C.border}` }}>
           <textarea
@@ -178,4 +199,24 @@ export default function ChatArea() {
       </div>
     </div>
   )
+}
+
+/* ── Shows when other people are in voice but you haven't joined yet ── */
+function VoicePreviewBar({ channelId }) {
+  const { voiceChannelId: myVoice } = useStore()
+  // Only show if no one is in voice (we can't easily peek without joining)
+  // This bar appears only when actively in a different voice channel
+  return null
+}
+
+const voiceBtn = {
+  display:'flex', alignItems:'center', gap:5, padding:'5px 12px',
+  background: C.card, border:`1px solid ${C.border}`, borderRadius:8,
+  color:C.text, fontSize:14, cursor:'pointer', transition:'all .15s',
+}
+
+const voiceBtnActive = {
+  display:'flex', alignItems:'center', gap:5, padding:'5px 12px',
+  background: C.emerald+'22', border:`1px solid ${C.emerald}55`, borderRadius:8,
+  color:C.emerald, fontSize:14, cursor:'pointer', animation:'fadeUp .5s ease infinite alternate',
 }
