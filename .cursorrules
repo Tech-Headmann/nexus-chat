@@ -1,0 +1,70 @@
+# NEXUS Chat — Cursor AI Rules
+
+## Project Overview
+Real-time Discord-style chat app.
+- **Frontend**: React 18 + Vite + Zustand (src/)
+- **Backend**: Express + Socket.IO + SQLite (server/)
+
+## Architecture
+
+### State Management
+All global state lives in `src/lib/store.js` (Zustand).
+- Socket events are bound once in `_bindSocketEvents()`
+- Do NOT add useState for things that should be global
+
+### Socket Events (server → client)
+- `new_message`     — new chat message in active channel
+- `online_update`   — array of online user IDs
+- `channel_created` — new channel broadcast to all
+- `friend_request`  — incoming friend request
+- `request_sent`    — confirmation your request was sent  
+- `friend_added`    — both users notified when friends
+- `user_typing`     — typing indicator in channel
+- `error`           — error string to show as toast
+
+### Socket Events (client → server)
+- `auth`                — authenticate socket with userId
+- `join_channel`        — subscribe to channel room
+- `send_message`        — send message to channel
+- `send_friend_request` — send friend request
+- `accept_request`      — accept incoming request
+- `decline_request`     — decline incoming request
+- `create_channel`      — create new public channel
+- `typing`              — typing indicator
+
+### REST API (server/index.js)
+- POST /api/register
+- POST /api/login
+- GET  /api/channels
+- GET  /api/channels/:id/messages
+- GET  /api/users
+- GET  /api/users/search?q=
+- GET  /api/users/:id/friends
+- GET  /api/users/:id/requests
+- POST /api/dm
+
+### Database Schema (SQLite)
+Tables: users, channels, channel_members, messages, friends, friend_requests
+
+## Code Style
+- Functional React components only
+- CSS-in-JS using plain objects (no CSS files, no Tailwind)
+- Theme colors from `src/lib/theme.js` — never hardcode hex values
+- Async/await for all API calls
+- Socket emissions go through store actions, not directly in components
+
+## When Adding Features
+1. Add DB schema changes to `server/index.js` db.exec()
+2. Add prepared statements to `stmts` object
+3. Add REST endpoint if needed for initial data load
+4. Add Socket.IO event handler in `io.on('connection')`
+5. Add store action in `src/lib/store.js`
+6. Bind new socket event in `_bindSocketEvents()`
+7. Build UI in appropriate component
+
+## File Responsibilities
+- `AuthScreen.jsx`   — login/register only
+- `Sidebar.jsx`      — all 4 views (chat/discover/friends/notifs)
+- `ChatArea.jsx`     — message display + input
+- `MembersPanel.jsx` — right panel with online users
+- `App.jsx`          — layout shell + icon rail + toast
