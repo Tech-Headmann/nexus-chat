@@ -30,6 +30,12 @@ export const api = {
     apiFetch('/api/account/password', { method:'POST', body:JSON.stringify({ userId, currentPassword, newPassword }) }),
   deleteAccount:  (userId, password) =>
     apiFetch('/api/account/delete', { method:'POST', body:JSON.stringify({ userId, password }) }),
+  uploadAvatar:   (userId, imageDataUrl) =>
+    apiFetch('/api/account/avatar', { method:'POST', body:JSON.stringify({ userId, imageDataUrl }) }),
+  updateDisplayName: (userId, displayName) =>
+    apiFetch('/api/account/displayname', { method:'POST', body:JSON.stringify({ userId, displayName }) }),
+  updateBio: (userId, bio) =>
+    apiFetch('/api/account/bio', { method:'POST', body:JSON.stringify({ userId, bio }) }),
 }
 
 export const socket = io(SERVER, { autoConnect: false })
